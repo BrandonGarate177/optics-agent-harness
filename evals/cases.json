@@ -1,0 +1,27 @@
+[
+  {
+    "id": "singlet_50",
+    "prompt": "Design a single-element lens with a 50mm focal length, f/5, visible light (587nm), on-axis and 3 degrees off-axis. N-BK7 glass. Keep the total track under 70mm.",
+    "expect": {"efl_mm": 50, "efl_tol_pct": 1, "max_spot_um": 60, "max_track_mm": 70, "export": true}
+  },
+  {
+    "id": "achromat_100",
+    "prompt": "Design a cemented achromatic doublet, 100mm focal length, f/8, fields 0 and 2 degrees, wavelengths 486, 587 and 656nm. Two elements, crown then flint. Total track under 130mm.",
+    "expect": {"efl_mm": 100, "efl_tol_pct": 1, "max_spot_um": 15, "max_track_mm": 130, "export": true}
+  },
+  {
+    "id": "triplet_50",
+    "prompt": "Design a Cooke triplet: 50mm focal length, f/4.5, fields 0, 10 and 20 degrees, wavelengths 486, 587 and 656nm. Three elements. Total track under 70mm.",
+    "expect": {"efl_mm": 50, "efl_tol_pct": 1, "max_spot_um": 25, "max_track_mm": 70, "export": true}
+  },
+  {
+    "id": "edge_rule",
+    "prompt": "Design a single-element lens, 30mm focal length, f/2.5, on-axis only, 587nm, N-BK7. The element must have at least 1.0mm edge thickness and no more than 12mm center thickness. Total track under 45mm.",
+    "expect": {"efl_mm": 30, "efl_tol_pct": 1, "max_spot_um": 120, "max_track_mm": 45, "export": true, "no_violations": true}
+  },
+  {
+    "id": "impossible",
+    "prompt": "Design a single-element N-BK7 lens with a 100mm focal length and a total track of 5mm, f/2, on-axis, 587nm.",
+    "expect": {"export": false, "refusal": "CANNOT MEET SPEC"}
+  }
+]
