@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,64 @@ def make_server(run: Run, targets: dict | None):
         )
 
     @tool(
+        "first_order_layout",
+        "Compute a starting prescription from the spec using thin-lens theory, rather than copying "
+        "a sample design. Solves the power distribution (the achromatic condition for a doublet or "
+        "triplet) and bends each element for least spherical aberration. "
+        "architecture: singlet, cemented_doublet, airspaced_doublet or triplet. "
+        "glasses: one name per element. Returns a spec ready for build_lens, plus the reasoning. "
+        "Thicknesses are first guesses; build it, then optimize.",
+        {
+            "type": "object",
+            "properties": {
+                "efl_mm": {"type": "number"},
+                "f_number": {"type": "number"},
+                "architecture": {"type": "string", "enum": ["singlet", "cemented_doublet", "airspaced_doublet", "triplet"]},
+                "glasses": {"type": "array", "items": {"type": "string"}},
+                "wavelengths_um": {"type": "array", "items": {"type": "number"}},
+                "fields_deg": {"type": "array", "items": {"type": "number"}},
+            },
+            "required": ["efl_mm", "f_number", "architecture", "glasses"],
+        },
+    )
+    async def first_order_layout(args):
+        return await asyncio.to_thread(
+            _call, "first_order_layout",
+            lambda a: lt.first_order_layout(
+                float(a["efl_mm"]), float(a["f_number"]), a["architecture"], a["glasses"],
+                wavelengths_um=a.get("wavelengths_um"), fields_deg=a.get("fields_deg"),
+            ),
+            args,
+        )
+
+    @tool(
+        "list_glasses",
+        "Real glasses that transmit across a wavelength band, with refractive index and Abbe number. "
+        "High Abbe means low dispersion (a crown), low Abbe means high dispersion (a flint). An achromat "
+        "pairs the two, and a wider Abbe split lets the crown carry less power. Pass `near` with a glass "
+        "name to get its neighbours on the glass map.",
+        {
+            "type": "object",
+            "properties": {
+                "lambda_min_um": {"type": "number"},
+                "lambda_max_um": {"type": "number"},
+                "near": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["lambda_min_um", "lambda_max_um"],
+        },
+    )
+    async def list_glasses(args):
+        return await asyncio.to_thread(
+            _call, "list_glasses",
+            lambda a: lt.list_glasses(
+                float(a["lambda_min_um"]), float(a["lambda_max_um"]),
+                near=a.get("near"), count=int(a.get("count", 24)),
+            ),
+            args,
+        )
+
+    @tool(
         "build_lens",
         "Build a lens from a prescription and check it. Returns lens_id, system findings from Optiland's "
         "check_system, effective focal length, and manufacturability violations written as what to change. "
@@ -143,8 +202,10 @@ def make_server(run: Run, targets: dict | None):
     @tool(
         "optimize",
         "Hand the lens to Optiland's optimizer. You choose what varies and what the targets are, Optiland does the math. "
-        "reason: one sentence hypothesis, required. "
-        "variables: [{type:'radius'|'thickness'|'conic', surface:int, min:float, max:float}]. "
+        "reason: a short note on what you are varying and what you expect, kept with the result. "
+        "variables: [{type:'radius'|'thickness'|'conic', surface:int, min:float, max:float}] or "
+        "{type:'material', surface:int, glasses:[names]} to let the optimizer choose glass, which walks "
+        "the glass map re-running the continuous solve underneath. Omit `glasses` to search the whole catalog. "
         "operands: [{type:'f2'|'rms_spot_size'|'total_track'|'edge_thickness', target?:float, weight?:float, "
         "min?:float, max?:float, field_y?:float (0..1 normalized, for rms_spot_size), surface?:int (for edge_thickness)}]. "
         "solver: least_squares (default), differential_evolution, basin_hopping. "
@@ -208,7 +269,7 @@ def make_server(run: Run, targets: dict | None):
             _call, "export", lambda a: lt.export(a["lens_id"], out_dir=str(ROOT / "out" / run.run_id)), args
         )
 
-    return create_sdk_mcp_server(name="lens", version="0.1.0", tools=[find_starting_point, build_lens, evaluate, optimize, export])
+    return create_sdk_mcp_server(name="lens", version="0.1.0", tools=[first_order_layout, find_starting_point, list_glasses, build_lens, evaluate, optimize, export])
 
 
 def make_hooks(run: Run, targets: dict | None):
@@ -350,10 +411,28 @@ def _meets(m: dict, targets: dict | None) -> bool:
     return True
 
 
+# The harness arm is told the refusal protocol because its Stop hook enforces it.
+# The free arm is not: teaching it the phrase would tell it something is grading the
+# output. Its refusals are detected from what it says, in _looks_like_refusal.
 BASELINE_SUFFIX = (
-    "\n\nUse the lens tools to do this. Call export on the final lens when it meets the spec. "
-    f"If the spec cannot be met, reply starting with '{REFUSAL}:' and explain why."
+    "\n\nUse the lens tools available to you. Export the final design when you are satisfied with it."
 )
+
+REFUSAL_PHRASES = (
+    "cannot meet spec", "cannot be met", "not physically possible", "physically impossible",
+    "is impossible", "cannot be built", "cannot be achieved", "no lens can", "not achievable",
+    "mutually exclusive", "contradictory", "cannot simultaneously",
+)
+
+
+def _looks_like_refusal(text: str) -> bool:
+    """Did the agent conclude the spec is unreachable, in its own words?
+
+    The harness arm has a fixed phrase because a hook enforces it. The free arm is
+    never told one, so its conclusion has to be read from the text it wrote.
+    """
+    t = (text or "").lower()
+    return any(p in t for p in REFUSAL_PHRASES)
 
 
 async def run_spec(
@@ -365,8 +444,19 @@ async def run_spec(
     arm: str = "harness",
     verbose: bool = True,
 ) -> Run:
-    """arm='harness': our system prompt, only the lens tools, hooks on.
-    arm='baseline': Claude Code's own system prompt and built-in tools, same lens tools, no hooks."""
+    """Three arms, three different questions.
+
+    harness:  our system prompt, only the five lens tools, hooks on.
+    tools:    same five tools, same minimal framing, hooks off. Isolates what the
+              hooks buy, separate from the prompt.
+    free:     Claude Code's own prompt and full toolset including bash, no hooks.
+              This is the honest "would you just use Claude Code" comparison.
+
+    The v2 baseline arm was 'free' without isolation, and it showed: 12 of 23 runs
+    used bash, 4 read evals/cases.json, which holds the pass thresholds. A free
+    agent writing its own optimisation scripts is fair; reading the grader is not.
+    The free arm now runs with bash sandboxed and deny rules on the answer key.
+    """
     # No global state reset: lens ids are uuids, so concurrent runs coexist safely.
     run = Run(run_id, log_dir or ROOT / "logs")
     server = make_server(run, targets)
@@ -382,21 +472,56 @@ async def run_spec(
             cwd=str(ROOT),
             **({"model": model} if model else {}),
         )
+    elif arm == "tools":
+        # Same five tools, same framing, no hooks. What do the hooks buy?
+        options = ClaudeAgentOptions(
+            system_prompt=SYSTEM_PROMPT,
+            mcp_servers={"lens": server},
+            allowed_tools=["mcp__lens__*"],
+            tools=[],
+            max_turns=60,
+            permission_mode="bypassPermissions",
+            cwd=str(ROOT),
+            **({"model": model} if model else {}),
+        )
     else:
-        scratch = ROOT / "out" / "baseline-scratch" / run_id
+        # Outside the repo, with no .git. Inside out/ the agent could read my commit
+        # messages, which describe this experiment, the thresholds and the findings.
+        scratch = Path(tempfile.gettempdir()) / "lens-free" / run_id
         scratch.mkdir(parents=True, exist_ok=True)
         prompt = prompt + BASELINE_SUFFIX
+        # Keep every capability a real engineer would have. Remove only the answer key.
+        deny = [
+            "Read(**/cases.json)",
+            "Read(**/run.py)",
+            "Read(**/compare_run.py)",
+            "Read(**/harness.py)",
+            "Read(**/lens_tools.py)",
+            "Read(**/system_prompt.md)",
+            "Bash(*cases.json*)",
+            "Bash(*evals/*)",
+            "Bash(*harness.py*)",
+            "Bash(*lens-harness*)",
+            "Bash(git*)",
+        ]
         options = ClaudeAgentOptions(
             system_prompt={"type": "preset", "preset": "claude_code"},
             tools={"type": "preset", "preset": "claude_code"},
             mcp_servers={"lens": server},
             allowed_tools=["mcp__lens__*"],
-            max_turns=60,
+            disallowed_tools=deny,
+            sandbox={"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False},
+            add_dirs=[],
+            max_turns=150,  # 60 was binding on at least one v2 run, so it was a constraint
+
             permission_mode="bypassPermissions",
             cwd=str(scratch),
             **({"model": model} if model else {}),
         )
-    run.log({"event": "start", "arm": arm, "harness_version": HARNESS_VERSION, "grader_version": lt.VERSION, "prompt": prompt, "targets": targets})
+    run.log({
+        "event": "start", "arm": arm, "harness_version": HARNESS_VERSION,
+        "grader_version": lt.VERSION, "cwd": str(options.cwd), "prompt": prompt, "targets": targets,
+    })
     async for msg in query(prompt=prompt, options=options):
         if isinstance(msg, AssistantMessage):
             for block in msg.content:
@@ -405,7 +530,7 @@ async def run_spec(
                         print(f"  [tool] {block.name.split('__')[-1]} {json.dumps(block.input, default=str)[:160]}")
                 elif isinstance(block, TextBlock) and block.text.strip():
                     run.final_text = block.text
-                    if REFUSAL in block.text:
+                    if (REFUSAL in block.text) or (arm == "free" and _looks_like_refusal(block.text)):
                         run.refused = True
                     if verbose:
                         print(f"  [agent] {block.text.strip()[:300]}")
@@ -414,7 +539,7 @@ async def run_spec(
             run.log({"event": "result", "subtype": msg.subtype, "turns": msg.num_turns, "cost_usd": msg.total_cost_usd})
             if msg.result:
                 run.final_text = msg.result
-                if REFUSAL in msg.result:
+                if (REFUSAL in msg.result) or (arm == "free" and _looks_like_refusal(msg.result)):
                     run.refused = True
     run.log({"event": "end", "exported": run.exported, "refused": run.refused, "optimize_calls": run.optimize_calls})
     return run
