@@ -61,7 +61,7 @@ async def main():
     ap.add_argument("-k", type=int, default=1)
     ap.add_argument("--only", default=None)
     ap.add_argument("--model", default=None)
-    ap.add_argument("--arm", default="harness", choices=["harness", "baseline", "both"])
+    ap.add_argument("--arm", default="harness", choices=["harness", "tools", "free", "baseline", "both", "all"])
     ap.add_argument("--label", default=None)
     ap.add_argument("--resume", default=None, help="log dir: rerun only rows that crashed on a transient API error")
     ap.add_argument("-j", "--concurrency", type=int, default=4, help="runs in flight at once (1 = sequential)")
@@ -71,7 +71,8 @@ async def main():
     if args.only:
         cases = [c for c in cases if c["id"] == args.only]
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    arms = ["harness", "baseline"] if args.arm == "both" else [args.arm]
+    arms = {"both": ["harness", "free"], "all": ["harness", "tools", "free"]}.get(args.arm, [args.arm])
+    arms = ["free" if a == "baseline" else a for a in arms]
     # "both" pairs each case's arms into one pool so they see the same API conditions.
     log_dirs = {a: ROOT / "logs" / f"{(args.label + '-' if args.label else '') + a}-{stamp}" for a in arms}
     log_dir = log_dirs[arms[0]]
