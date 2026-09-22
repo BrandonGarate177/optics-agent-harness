@@ -34,7 +34,11 @@ import lens_tools as lt
 ROOT = Path(__file__).parent
 import os
 MAX_OPTIMIZE = int(os.environ.get("LENS_MAX_OPTIMIZE", "10"))
-HARNESS_VERSION = "2.0"
+# v3: the optimize cap alone let one run make 77 calls (33 build, 32 evaluate)
+# without touching its budget. Healthy runs use 7 to 34 tools; the two runaway
+# runs used 57 and 77. Cap the total, and always leave export reachable.
+MAX_TOOL_CALLS = int(os.environ.get("LENS_MAX_TOOL_CALLS", "45"))
+HARNESS_VERSION = "3.0"
 REFUSAL = "CANNOT MEET SPEC"
 SYSTEM_PROMPT = (ROOT / "system_prompt.md").read_text()
 
@@ -222,11 +226,27 @@ def make_hooks(run: Run, targets: dict | None):
         name = input_data.get("tool_name", "")
         short = name.split("__")[-1]
         tin = input_data.get("tool_input") or {}
+        if short != "export" and len(run.tool_calls) >= MAX_TOOL_CALLS:
+            state = (
+                "Your last evaluate met the targets, so export is available now."
+                if run.last_eval_ok
+                else "Your last evaluate did not meet the targets."
+            )
+            return deny(
+                f"Tool budget spent ({MAX_TOOL_CALLS} calls). {state} Either export, or write a "
+                f"refusal starting with '{REFUSAL}:'.",
+                short, tin,
+            )
         if short == "optimize":
             if run.optimize_calls >= MAX_OPTIMIZE:
+                state = (
+                    "Your last evaluate met the targets, so export is available now."
+                    if run.last_eval_ok
+                    else "Your last evaluate did not meet the targets."
+                )
                 return deny(
-                    f"Iteration budget spent ({MAX_OPTIMIZE} optimize calls). Either export the best lens you have "
-                    f"if it meets spec, or write a refusal starting with '{REFUSAL}:'.",
+                    f"Iteration budget spent ({MAX_OPTIMIZE} optimize calls). {state} Either export, "
+                    f"or write a refusal starting with '{REFUSAL}:'.",
                     short, tin,
                 )
             if not tin.get("reason"):
@@ -247,8 +267,19 @@ def make_hooks(run: Run, targets: dict | None):
             return {}
         if input_data.get("stop_hook_active"):
             return {}
-        reason = f"You have not exported a lens or written a refusal starting with '{REFUSAL}:'. Do one of the two."
-        run.log({"event": "hook_block_stop", "reason": reason})
+        # v3: a run once refused a passing lens because this message never mentioned
+        # that export had become available. The hook knows; now it says so.
+        if run.last_eval_ok:
+            reason = (
+                "Your last evaluate met every target with no manufacturability violations, so "
+                "export will succeed. Call export on that lens before you stop."
+            )
+        else:
+            reason = (
+                f"You have not exported a lens or written a refusal starting with '{REFUSAL}:'. "
+                f"Do one of the two."
+            )
+        run.log({"event": "hook_block_stop", "reason": reason, "last_eval_ok": run.last_eval_ok})
         return {"decision": "block", "reason": reason}
 
     return {
