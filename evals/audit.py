@@ -25,8 +25,14 @@ ANSWER_KEY = ("cases.json", "evals/", "harness.py", "lens_tools.py", "system_pro
 
 
 def transcript_dir(cwd: str) -> Path:
-    """Claude Code slugs the working directory to name its project folder."""
-    return Path.home() / ".claude" / "projects" / cwd.replace("/", "-").replace("_", "-").replace(".", "-")
+    """Claude Code slugs the working directory to name its project folder.
+
+    The path has to be resolved first: on macOS a temp directory reported as
+    /var/folders/... is stored as /private/var/folders/..., and the slug follows
+    the resolved form.
+    """
+    resolved = str(Path(cwd).resolve())
+    return Path.home() / ".claude" / "projects" / resolved.replace("/", "-").replace("_", "-").replace(".", "-")
 
 
 def audit_run(jsonl: Path, repo: Path | None = None) -> dict:
@@ -55,7 +61,18 @@ def audit_run(jsonl: Path, repo: Path | None = None) -> dict:
             out["transcript"] = "UNAUDITABLE: no cwd recorded and no transcript found"
             return out
     d = transcript_dir(cwd)
-    files = sorted(glob.glob(str(d / "*.jsonl")), key=os.path.getmtime, reverse=True)
+    # Prefer the exact session. Arms that share a working directory otherwise all
+    # resolve to the same newest transcript, and the audit silently reads one run
+    # several times while reporting on several.
+    sid = next((e.get("session_id") for e in events if e.get("event") == "result" and e.get("session_id")), None)
+    exact = d / f"{sid}.jsonl" if sid else None
+    if exact and exact.exists():
+        files = [str(exact)]
+    elif sid:
+        out["transcript"] = f"UNAUDITABLE: session {sid[:8]} has no transcript in {d.name}"
+        return out
+    else:
+        files = sorted(glob.glob(str(d / "*.jsonl")), key=os.path.getmtime, reverse=True)
     if not files:
         out["transcript"] = f"UNAUDITABLE: no transcript at {d.name}"
         return out

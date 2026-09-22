@@ -69,7 +69,8 @@ async def main():
 
     cases = json.loads((ROOT / "evals" / "cases.json").read_text())
     if args.only:
-        cases = [c for c in cases if c["id"] == args.only]
+        wanted = {x.strip() for x in args.only.split(",")}
+        cases = [c for c in cases if c["id"] in wanted]
     stamp = time.strftime("%Y%m%d-%H%M%S")
     arms = {"both": ["harness", "free"], "all": ["harness", "tools", "free"]}.get(args.arm, [args.arm])
     arms = ["free" if a == "baseline" else a for a in arms]

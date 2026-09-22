@@ -39,6 +39,10 @@ MAX_OPTIMIZE = int(os.environ.get("LENS_MAX_OPTIMIZE", "10"))
 # without touching its budget. Healthy runs use 7 to 34 tools; the two runaway
 # runs used 57 and 77. Cap the total, and always leave export reachable.
 MAX_TOOL_CALLS = int(os.environ.get("LENS_MAX_TOOL_CALLS", "45"))
+# Turns are not a budget, they are a safety stop. Every arm gets the same generous
+# ceiling so the only deliberate constraint in the experiment is the harness's tool
+# cap. The validation run peaked at 44 turns, so this never binds in practice.
+MAX_TURNS = int(os.environ.get("LENS_MAX_TURNS", "150"))
 HARNESS_VERSION = "3.0"
 REFUSAL = "CANNOT MEET SPEC"
 SYSTEM_PROMPT = (ROOT / "system_prompt.md").read_text()
@@ -467,7 +471,7 @@ async def run_spec(
             allowed_tools=["mcp__lens__*"],
             tools=[],
             hooks=make_hooks(run, targets),
-            max_turns=60,
+            max_turns=MAX_TURNS,
             permission_mode="bypassPermissions",
             cwd=str(ROOT),
             **({"model": model} if model else {}),
@@ -479,7 +483,7 @@ async def run_spec(
             mcp_servers={"lens": server},
             allowed_tools=["mcp__lens__*"],
             tools=[],
-            max_turns=60,
+            max_turns=MAX_TURNS,
             permission_mode="bypassPermissions",
             cwd=str(ROOT),
             **({"model": model} if model else {}),
@@ -512,7 +516,7 @@ async def run_spec(
             disallowed_tools=deny,
             sandbox={"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False},
             add_dirs=[],
-            max_turns=150,  # 60 was binding on at least one v2 run, so it was a constraint
+            max_turns=MAX_TURNS,
 
             permission_mode="bypassPermissions",
             cwd=str(scratch),
@@ -520,7 +524,8 @@ async def run_spec(
         )
     run.log({
         "event": "start", "arm": arm, "harness_version": HARNESS_VERSION,
-        "grader_version": lt.VERSION, "cwd": str(options.cwd), "prompt": prompt, "targets": targets,
+        "grader_version": lt.VERSION, "cwd": str(Path(options.cwd).resolve()),
+        "prompt": prompt, "targets": targets,
     })
     async for msg in query(prompt=prompt, options=options):
         if isinstance(msg, AssistantMessage):
@@ -536,7 +541,13 @@ async def run_spec(
                         print(f"  [agent] {block.text.strip()[:300]}")
         elif isinstance(msg, ResultMessage):
             run.cost_usd, run.turns = msg.total_cost_usd, msg.num_turns
-            run.log({"event": "result", "subtype": msg.subtype, "turns": msg.num_turns, "cost_usd": msg.total_cost_usd})
+            # session_id names the Claude Code transcript file exactly. Without it the
+            # audit has to guess from the working directory, and every run of an arm
+            # that shares a cwd maps to the same transcript.
+            run.log({
+                "event": "result", "subtype": msg.subtype, "turns": msg.num_turns,
+                "cost_usd": msg.total_cost_usd, "session_id": getattr(msg, "session_id", None),
+            })
             if msg.result:
                 run.final_text = msg.result
                 if (REFUSAL in msg.result) or (arm == "free" and _looks_like_refusal(msg.result)):
