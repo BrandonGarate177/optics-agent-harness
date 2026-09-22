@@ -34,6 +34,7 @@ RULES = {
     "min_air_gap_edge_mm": 0.3,
     "max_diameter_to_thickness": 10.0,
     "min_radius_to_semi_aperture": 1.2,
+    "allowed_catalogs": ["schott", "ohara", "hoya"],
 }
 
 # Schott renamed these when it dropped arsenic and lead. The old names still trace
@@ -388,12 +389,26 @@ def optimize(
     lens = STATE[lens_id]
     before = _metrics(lens)
     problem = optimization.OptimizationProblem()
+    wls = _wavelengths_um(lens)
+    has_material = False
     for v in variables:
         kwargs = {}
-        if v.get("min") is not None:
-            kwargs["min_val"] = v["min"]
-        if v.get("max") is not None:
-            kwargs["max_val"] = v["max"]
+        if v["type"] == "material":
+            # v3: glass was previously unreachable through the optimizer. Categorical,
+            # so it goes to GlassExpert, which walks the glass map re-running the
+            # continuous solve underneath.
+            from optiland.materials import glasses_selection  # noqa: PLC0415
+
+            choices = v.get("glasses") or glasses_selection(
+                lambda_min=min(wls), lambda_max=max(wls), catalogs=RULES["allowed_catalogs"]
+            )
+            kwargs["glass_selection"] = list(choices)
+            has_material = True
+        else:
+            if v.get("min") is not None:
+                kwargs["min_val"] = v["min"]
+            if v.get("max") is not None:
+                kwargs["max_val"] = v["max"]
         problem.add_variable(lens, v["type"], surface_number=v["surface"], **kwargs)
     primary = lens.primary_wavelength
     for op in operands:
@@ -426,7 +441,11 @@ def optimize(
         # Global solvers scale badly with variable count. Cap them so one call can't eat an hour.
         maxiter = min(maxiter, GLOBAL_MAXITER)
     try:
-        if solver == "least_squares":
+        if has_material:
+            optimization.GlassExpert(problem).run(
+                num_neighbours=6, maxiter=min(maxiter, 200), tol=1e-6, disp=False, verbose=False
+            )
+        elif solver == "least_squares":
             bounded = any(v.get("min") is not None or v.get("max") is not None for v in variables)
             opt.optimize(maxiter=maxiter, tol=1e-6, method_choice="trf" if bounded else "lm")
         else:
@@ -443,6 +462,192 @@ def optimize(
         "before": {k: before[k] for k in ("efl_mm", "rms_spot_um_per_field", "total_track_mm")},
         "after": after,
         "prescription": _prescription(lens),
+    }
+
+
+def first_order_layout(
+    efl_mm: float,
+    f_number: float,
+    architecture: str,
+    glasses: list[str],
+    wavelengths_um: list[float] | None = None,
+    fields_deg: list[float] | None = None,
+    back_focus_mm: float | None = None,
+) -> dict:
+    """Compute a starting prescription from the spec using thin-lens theory.
+
+    v3: the alternative was find_starting_point, which hands over a sample design.
+    That works when the library has something close and misleads when it does not.
+    This solves the first-order problem instead: power distribution from the
+    achromatic condition, then a best-form or equiconvex bending per element.
+
+    architecture: singlet | cemented_doublet | airspaced_doublet | triplet
+    glasses: one name for a singlet, two for a doublet, three for a triplet.
+    """
+    from optiland.materials import get_nd_vd  # noqa: PLC0415
+
+    wls = wavelengths_um or [0.587]
+    phi = 1.0 / float(efl_mm)
+    epd = float(efl_mm) / float(f_number)
+    nd = []
+    vd = []
+    for g in glasses:
+        n, v = get_nd_vd(g)
+        nd.append(float(n))
+        vd.append(float(v))
+
+    def bend_best_form(power, n):
+        """Coddington shape factor for least spherical aberration at infinite conjugate."""
+        if abs(power) < 1e-12:
+            return None, None
+        q = -2.0 * (n * n - 1.0) / (n + 2.0)
+        c = power / (n - 1.0)
+        c1, c2 = c * (1.0 + q) / 2.0, c * (q - 1.0) / 2.0
+        return (1.0 / c1 if abs(c1) > 1e-12 else None), (1.0 / c2 if abs(c2) > 1e-12 else None)
+
+    def equiconvex(power, n):
+        if abs(power) < 1e-12:
+            return None, None
+        r = 2.0 * (n - 1.0) / power
+        return r, -r
+
+    surfaces = [{"radius": None, "thickness": None, "material": None}]
+    steps = []
+
+    if architecture == "singlet":
+        r1, r2 = bend_best_form(phi, nd[0])
+        t = max(RULES["min_center_thickness_mm"], epd / 8.0)
+        surfaces += [
+            {"radius": r1, "thickness": round(t, 3), "material": glasses[0], "is_stop": True},
+            {"radius": r2, "thickness": round(back_focus_mm or efl_mm * 0.92, 3), "material": None},
+        ]
+        steps.append(f"single element, best-form bending for n={nd[0]:.3f}")
+
+    elif architecture in ("cemented_doublet", "airspaced_doublet"):
+        if architecture == "cemented_doublet":
+            # Achromatic condition: powers split by Abbe number so colour cancels.
+            denom = vd[0] - vd[1]
+            if abs(denom) < 1e-6:
+                return {"error": "the two glasses have nearly equal Abbe numbers, so they cannot achromatise. Pick a crown and a flint."}
+            p1 = phi * vd[0] / denom
+            p2 = -phi * vd[1] / denom
+            steps.append(f"achromatic solve: Abbe {vd[0]:.1f} and {vd[1]:.1f}, powers {p1:.5f} and {p2:.5f}")
+            c1 = 1.0 / (efl_mm * 0.62)
+            c2 = c1 - p1 / (nd[0] - 1.0)
+            c3 = c2 - p2 / (nd[1] - 1.0)
+            t1 = max(RULES["min_center_thickness_mm"], epd / 7.0)
+            t2 = max(RULES["min_center_thickness_mm"], epd / 12.0)
+            surfaces += [
+                {"radius": 1.0 / c1, "thickness": round(t1, 3), "material": glasses[0], "is_stop": True},
+                {"radius": 1.0 / c2 if abs(c2) > 1e-12 else None, "thickness": round(t2, 3), "material": glasses[1]},
+                {"radius": 1.0 / c3 if abs(c3) > 1e-12 else None, "thickness": round(back_focus_mm or efl_mm * 0.96, 3), "material": None},
+            ]
+        else:
+            # Single wavelength or air-spaced: split power evenly, bend each for least spherical.
+            p1 = p2 = phi / 2.0
+            ra1, ra2 = bend_best_form(p1, nd[0])
+            rb1, rb2 = bend_best_form(p2, nd[1])
+            t = max(RULES["min_center_thickness_mm"], epd / 6.0)
+            surfaces += [
+                {"radius": ra1, "thickness": round(t, 3), "material": glasses[0], "is_stop": True},
+                {"radius": ra2, "thickness": round(max(RULES["min_air_gap_center_mm"], epd / 12.0), 3), "material": None},
+                {"radius": rb1, "thickness": round(t, 3), "material": glasses[1]},
+                {"radius": rb2, "thickness": round(back_focus_mm or efl_mm * 0.7, 3), "material": None},
+            ]
+            steps.append("power split evenly between two air-spaced elements, each bent for least spherical")
+
+    elif architecture == "triplet":
+        # Symmetric outer positives, inner negative, achromatised across the three.
+        if abs(vd[0]) < 1e-6:
+            return {"error": "bad Abbe number for the outer glass"}
+        ratio = vd[1] / vd[0]
+        denom = 2.0 * (1.0 - ratio)
+        if abs(denom) < 1e-6:
+            return {"error": "outer and inner glasses have nearly equal Abbe numbers, so the triplet cannot achromatise"}
+        pa = phi / denom
+        pb = -2.0 * pa * ratio
+        steps.append(f"achromatic triplet solve: outer power {pa:.5f} each, inner {pb:.5f}")
+        r1, r2 = equiconvex(pa, nd[0])
+        r3, r4 = equiconvex(pb, nd[1])
+        r5, r6 = equiconvex(pa, nd[2])
+        gap = max(RULES["min_air_gap_center_mm"], epd / 10.0)
+        tp = max(RULES["min_center_thickness_mm"], epd / 6.0)
+        tn = max(RULES["min_center_thickness_mm"], epd / 14.0)
+        surfaces += [
+            {"radius": r1, "thickness": round(tp, 3), "material": glasses[0]},
+            {"radius": r2, "thickness": round(gap, 3), "material": None},
+            {"radius": r3, "thickness": round(tn, 3), "material": glasses[1]},
+            {"radius": r4, "thickness": round(gap, 3), "material": None, "is_stop": True},
+            {"radius": r5, "thickness": round(tp, 3), "material": glasses[2]},
+            {"radius": r6, "thickness": round(back_focus_mm or efl_mm * 0.8, 3), "material": None},
+        ]
+    else:
+        return {"error": f"unknown architecture '{architecture}'. Use singlet, cemented_doublet, airspaced_doublet or triplet."}
+
+    surfaces.append({"radius": None})
+    for s_ in surfaces:
+        if s_.get("radius") is not None:
+            s_["radius"] = round(float(s_["radius"]), 4)
+    spec = {
+        "surfaces": surfaces,
+        "epd": round(epd, 4),
+        "fields_deg": fields_deg or [0.0],
+        "wavelengths_um": wls,
+    }
+    return {
+        "spec": spec,
+        "architecture": architecture,
+        "glasses": [{"glass": g, "nd": round(n, 4), "abbe_vd": round(v, 2)} for g, n, v in zip(glasses, nd, vd)],
+        "reasoning": steps,
+        "note": "Thin-lens starting point computed from the spec, not copied from a sample. "
+                "Thicknesses are first guesses. Build it, then optimise.",
+    }
+
+
+def list_glasses(
+    lambda_min_um: float,
+    lambda_max_um: float,
+    near: str | None = None,
+    count: int = 24,
+) -> dict:
+    """Glasses that transmit across a wavelength band, with index and Abbe number.
+
+    v3: the agent used to pick glass from memory, which is why it only ever reached
+    for the library's pair. `near` returns the neighbours of a named glass on the
+    glass map, which is how a designer actually explores alternatives.
+    """
+    from optiland.materials import get_nd_vd, get_neighbour_glasses, glasses_selection  # noqa: PLC0415
+
+    available = glasses_selection(
+        lambda_min=lambda_min_um, lambda_max=lambda_max_um, catalogs=RULES["allowed_catalogs"]
+    )
+    if near:
+        try:
+            names = get_neighbour_glasses(near, glass_selection=available, num_neighbours=count)
+        except Exception:  # noqa: BLE001
+            names = available
+    else:
+        names = available
+    out = []
+    for g in names:
+        try:
+            nd, vd = get_nd_vd(g)
+            out.append({"glass": g, "nd": round(float(nd), 4), "abbe_vd": round(float(vd), 2)})
+        except Exception:  # noqa: BLE001
+            continue
+    out.sort(key=lambda r: -r["abbe_vd"])
+    if not near and len(out) > count:
+        # Even spread across the Abbe range, so the agent sees crowns and flints,
+        # not an alphabetical slice of one corner of the glass map.
+        idx = [round(i * (len(out) - 1) / (count - 1)) for i in range(count)]
+        out = [out[i] for i in sorted(set(idx))]
+    return {
+        "band_um": [lambda_min_um, lambda_max_um],
+        "catalogs": RULES["allowed_catalogs"],
+        "count": len(out),
+        "glasses": out,
+        "note": "High Abbe number means low dispersion (crown). Low Abbe means high dispersion (flint). "
+                "An achromat pairs a crown and a flint; a wider Abbe split lets the crown carry less power.",
     }
 
 

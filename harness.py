@@ -289,11 +289,35 @@ def make_hooks(run: Run, targets: dict | None):
 
 
 def _meets(m: dict, targets: dict | None) -> bool:
-    """Deterministic pass/fail against the case targets. Grader v2."""
+    """Deterministic pass/fail against the case targets. Grader v3.
+
+    v3 adds spec conformance. v2 only measured how well the lens performed and
+    never checked it was the lens that was asked for. On lidar_905-1 the agent
+    rebuilt at half the required entrance pupil, f/2.8 against a spec of f/1.4,
+    optimised that much easier lens to 6.4 microns, and the grader passed it.
+    The agent refused to ship it anyway, which is the only reason it did not
+    become an exported result.
+    """
     if m.get("manufacturability_violations"):
         return False
     if not targets:
         return True
+    # Conformance first: is this even the requested lens?
+    if "f_number" in targets:
+        fno = m.get("f_number")
+        tol = targets.get("f_number_tol_pct", 3) / 100 * targets["f_number"]
+        if not isinstance(fno, (int, float)) or abs(fno - targets["f_number"]) > tol:
+            return False
+    if "fields_deg" in targets:
+        got = [round(float(f), 3) for f in (m.get("fields_deg") or [])]
+        want = [round(float(f), 3) for f in targets["fields_deg"]]
+        if got != want:
+            return False
+    if "wavelengths_um" in targets:
+        got = [round(float(w), 4) for w in (m.get("wavelengths_um") or [])]
+        want = [round(float(w), 4) for w in targets["wavelengths_um"]]
+        if got != want:
+            return False
     efl = m.get("efl_mm")
     if "efl_mm" in targets and isinstance(efl, (int, float)):
         tol = targets.get("efl_tol_pct", 1) / 100 * targets["efl_mm"]
