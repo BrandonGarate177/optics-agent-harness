@@ -55,5 +55,42 @@
    "export": false,
    "refusal": "CANNOT MEET SPEC"
   }
+ },
+ {
+  "id": "lidar_905",
+  "prompt": "Design a receiver lens for a 905nm pulsed LiDAR. 25mm focal length, f/1.4, fields 0 and 3 degrees, single wavelength 905nm. Two spherical elements, air-spaced or cemented is your call. Spherical surfaces only, no aspheres. Total track under 45mm, and leave at least 12mm of back focal distance for the detector package.",
+  "expect": {
+   "efl_mm": 25,
+   "efl_tol_pct": 1,
+   "max_spot_um": 45,
+   "max_track_mm": 45,
+   "min_bfd_mm": 12,
+   "max_wavefront_waves": 12.0,
+   "export": true
+  }
+ },
+ {
+  "id": "thermal_lwir",
+  "prompt": "Design a lens for an uncooled thermal imaging camera. 25mm focal length, f/1.2, fields 0 and 5 degrees, wavelength 10 microns. The material is germanium, which Optiland calls GE. One or two spherical elements. Spherical surfaces only, no aspheres. Total track under 40mm, and leave at least 10mm of back focal distance for the sensor package.",
+  "expect": {
+   "efl_mm": 25,
+   "efl_tol_pct": 1,
+   "max_spot_um": 95,
+   "max_track_mm": 40,
+   "min_bfd_mm": 10,
+   "max_wavefront_waves": 3.0,
+   "export": true
+  }
+ },
+ {
+  "id": "relay_1to1",
+  "prompt": "Design a 1:1 relay lens. The object sits 100mm in front of the first surface and must be imaged at unit magnification, so magnification of -1.0. f/4, fields 0 and 2 degrees, wavelengths 486, 587 and 656nm. Two spherical elements. Spherical surfaces only, no aspheres. Important: the object is at a finite distance, not at infinity, so set the thickness of surface 0 to 100 rather than leaving it null. Total track under 220mm.",
+  "expect": {
+   "magnification": -1.0,
+   "magnification_tol": 0.05,
+   "max_spot_um": 80,
+   "max_track_mm": 220,
+   "export": true
+  }
  }
 ]

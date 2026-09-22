@@ -119,7 +119,7 @@ def make_server(run: Run, targets: dict | None):
         "Build a lens from a prescription and check it. Returns lens_id, system findings from Optiland's "
         "check_system, effective focal length, and manufacturability violations written as what to change. "
         "spec = {surfaces:[{radius,thickness,material,is_stop}], epd, fields_deg:[..], wavelengths_um:[..]}. "
-        "Surface 0 is the object (thickness null = infinity). Last surface is the image. radius null = flat. "
+        "Surface 0 is the object: thickness null means the object is at infinity, a number means the object sits that many mm in front of surface 1 (finite conjugate). Last surface is the image. radius null = flat. "
         "material null = air. Set is_stop on exactly one surface.",
         {"type": "object", "properties": {"spec": {"type": "object"}}, "required": ["spec"]},
     )
@@ -282,6 +282,11 @@ def _meets(m: dict, targets: dict | None) -> bool:
     if "max_chromatic_shift_mm" in targets:
         c = m.get("chromatic_focal_shift_mm")
         if not isinstance(c, (int, float)) or c > targets["max_chromatic_shift_mm"]:
+            return False
+    if "magnification" in targets:
+        mag = m.get("magnification")
+        tol = targets.get("magnification_tol", 0.05)
+        if not isinstance(mag, (int, float)) or abs(mag - targets["magnification"]) > tol:
             return False
     if "min_bfd_mm" in targets:
         b = m.get("back_focal_distance_mm")
