@@ -1,5 +1,7 @@
 # lens-harness
 
+**v2 (2026-09-22).** The v1 manufacturability gate was dead code: `float()` on a numpy array raised inside a bare `except`, so every lens passed. Fixed, plus new checks and a grader that reads wavefront and colour. Regrading v1's own exports under v2 drops the harness arm from 12/12 to 5/12 and the baseline from 12/12 to 6/12. See `evals/optics-review-2026-09-22.md`.
+
 A harness that designs lenses with a Claude agent and [Optiland](https://github.com/optiland/optiland). Plain-English spec in, a verified prescription (.zmx and .json) out, every decision logged.
 
 The one design rule: the agent never hand-tunes a radius. It picks the architecture, the variables, the bounds and the merit function. Optiland's optimizer does the math. The harness enforces the loop in code, not in the prompt.
@@ -20,9 +22,13 @@ The one design rule: the agent never hand-tunes a radius. It picks the architect
 
 - `find_starting_point(elements, f_number, field_deg)`: nearest known-good prescriptions from Optiland's sample library. The agent never starts from a blank page.
 - `build_lens(spec)`: builds the Optic, runs Optiland's `check_system` diagnostics and the manufacturability rules, returns violations as sentences that say what to change.
-- `evaluate(lens_id)`: RMS spot per field, RMS wavefront per field, focal length, f-number, track length, violations. Deterministic.
+- `evaluate(lens_id)`: RMS spot per field (RMS across wavelengths, not mean), RMS wavefront per field, chromatic focal shift, back focal distance, focal length, f-number, track length, violations. Deterministic.
 - `optimize(lens_id, reason, variables, operands, solver)`: hands variables with bounds and operands with targets to Optiland. `reason` is a required one-sentence hypothesis. Solver is least squares by default (bounded via trust region when bounds are set), or a global method.
 - `export(lens_id)`: `.zmx` and `.json`.
+
+## Manufacturability checks (v2)
+
+Edge thickness (including surfaces that cross), center thickness, diameter to thickness ratio, air gap on axis and at the edge, radius versus semi-aperture, discontinued glass names, and conic constants. An asphere is rejected unless the spec sets `allow_aspheres`.
 
 ## The rules (hooks)
 

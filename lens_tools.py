@@ -7,6 +7,7 @@ ids and numbers, never the Optic object.
 from __future__ import annotations
 
 import json
+import signal
 import uuid
 from pathlib import Path
 
@@ -22,16 +23,33 @@ from optiland.optic import Optic
 STATE: dict[str, Optic] = {}
 ITERATIONS: dict[str, int] = {}
 
+VERSION = "2.0"
+
+# Manufacturing floors. v2: diameter/thickness tightened from 15 to 10 on optical
+# shop advice, edge air gap and radius/aperture added, aspheres must be declared.
 RULES = {
     "min_edge_thickness_mm": 1.0,
     "min_center_thickness_mm": 1.5,
     "max_center_thickness_mm": 25.0,
-    "min_air_gap_mm": 0.5,
-    "max_diameter_to_thickness": 15.0,
-    "allowed_catalogs": ["schott", "ohara"],
+    "min_air_gap_center_mm": 0.5,
+    "min_air_gap_edge_mm": 0.3,
+    "max_diameter_to_thickness": 10.0,
+    "min_radius_to_semi_aperture": 1.2,
+}
+
+# Schott renamed these when it dropped arsenic and lead. The old names still trace
+# but you cannot buy the glass.
+DEPRECATED_GLASS = {
+    "BK7": "N-BK7", "BAK1": "N-BAK1", "BAK4": "N-BAK4", "BALF4": "N-BALF4",
+    "BAF10": "N-BAF10", "F2": "N-F2", "F5": "N-F5", "K5": "N-K5",
+    "LAK9": "N-LAK9", "LAK22": "N-LAK22", "LAF2": "N-LAF2", "PSK3": "N-PSK3",
+    "SF1": "N-SF1", "SF2": "N-SF2", "SF5": "N-SF5", "SF6": "N-SF6",
+    "SF10": "N-SF10", "SF11": "N-SF11", "SK2": "N-SK2", "SK4": "N-SK4",
+    "SK11": "N-SK11", "SK16": "N-SK16", "SSK5": "N-SSK5", "ZK7": "N-ZK7",
 }
 
 GLOBAL_MAXITER = 25
+OPTIMIZE_TIMEOUT_S = 240
 
 SOLVERS = {
     "least_squares": optimization.LeastSquares,
@@ -49,7 +67,8 @@ def _wavelengths_um(lens: Optic) -> list[float]:
 
 
 def _build_optic(spec: dict) -> Optic:
-    """spec: {surfaces:[{radius,thickness,material,is_stop,conic}], epd, fields_deg:[..], wavelengths_um:[..]}"""
+    """spec: {surfaces:[{radius,thickness,material,is_stop,conic}], epd, fields_deg:[..],
+    wavelengths_um:[..], allow_aspheres: bool}"""
     lens = Optic()
     surfaces = spec["surfaces"]
     for i, s in enumerate(surfaces):
@@ -77,6 +96,7 @@ def _build_optic(spec: dict) -> Optic:
     wls = spec.get("wavelengths_um", [0.587])
     for i, w in enumerate(wls):
         lens.wavelengths.add(value=w, is_primary=(i == len(wls) // 2))
+    lens._allow_aspheres = bool(spec.get("allow_aspheres", False))
     return lens
 
 
@@ -92,6 +112,7 @@ def _prescription(lens: Optic) -> list[dict]:
                 "radius": None if not np.isfinite(radius) else round(float(radius), 4),
                 "thickness": None if not np.isfinite(surf.thickness) else round(float(surf.thickness), 4),
                 "material": getattr(surf.material_post, "name", None) or type(surf.material_post).__name__,
+                "conic": round(_conic(surf), 4),
                 "is_stop": bool(surf.is_stop),
             }
         )
@@ -115,59 +136,125 @@ def _is_glass(surf) -> bool:
     return name.lower() not in ("", "air") and type(surf.material_post).__name__ != "IdealMaterial"
 
 
+def _conic(surf) -> float:
+    """Conic constant. Nonzero means the surface is an asphere, not a sphere."""
+    k = getattr(surf.geometry, "k", None)
+    if k is None:
+        return 0.0
+    try:
+        return float(np.ravel(k)[0])
+    except Exception:
+        return 0.0
+
+
+def _edge_thickness(lens: Optic, i: int) -> float | None:
+    """Edge thickness of the space after surface i, at the traced clear aperture.
+
+    v2 bug fix: Optiland returns a (1,) array here and float() on it raises under
+    numpy 2. v1 swallowed that in a bare except, so this check never ran and every
+    lens passed. See evals/optics-review-2026-09-22.md.
+    """
+    try:
+        problem = optimization.OptimizationProblem()
+        problem.add_operand(
+            operand_type="edge_thickness",
+            target=0,
+            input_data={"optic": lens, "surface_number": i},
+        )
+        return float(np.ravel(problem.operands[0].value)[0])
+    except Exception:
+        return None
+
+
 def _manufacturability(lens: Optic) -> list[str]:
-    """Return a list of violations as plain sentences that say what to change."""
+    """Violations as plain sentences that say what to change."""
     problems = []
     surfaces = lens.surfaces.surfaces
     sds = _semi_diameters(lens)
+    allow_asph = bool(getattr(lens, "_allow_aspheres", False))
+
     for i in range(1, len(surfaces) - 1):
         surf = surfaces[i]
         t = float(surf.thickness)
+        sd = sds[i] if i < len(sds) else 0.0
+        edge = _edge_thickness(lens, i)
+
+        # Surface-level checks apply to glass and air alike.
+        k = _conic(surf)
+        if abs(k) > 1e-9 and not allow_asph:
+            problems.append(
+                f"surface {i} has a conic of {k:.4f}, which makes it an asphere. The spec "
+                f"asked for spherical surfaces. Set conic to 0, or set allow_aspheres in the "
+                f"spec if an asphere is genuinely permitted"
+            )
+        radius = getattr(surf.geometry, "radius", float("inf"))
+        if np.isfinite(radius) and sd > 0:
+            ratio = abs(float(radius)) / sd
+            if ratio < RULES["min_radius_to_semi_aperture"]:
+                problems.append(
+                    f"surface {i} has a radius of {float(radius):.2f}mm over a semi-aperture of "
+                    f"{sd:.2f}mm (ratio {ratio:.2f}). Below {RULES['min_radius_to_semi_aperture']} "
+                    f"the surface approaches a hemisphere and cannot be ground and polished. "
+                    f"Weaken the curvature or reduce the aperture"
+                )
+
         if not np.isfinite(t):
             continue
+
         if _is_glass(surf):
+            name = (getattr(surf.material_post, "name", "") or "").upper()
+            if name in DEPRECATED_GLASS:
+                problems.append(
+                    f"surface {i} uses {name}, which is discontinued. Use "
+                    f"{DEPRECATED_GLASS[name]} instead"
+                )
             if t < RULES["min_center_thickness_mm"]:
                 problems.append(
-                    f"center thickness of element starting at surface {i} is {t:.2f}mm, "
-                    f"minimum is {RULES['min_center_thickness_mm']}mm, increase it"
+                    f"center thickness of the element at surface {i} is {t:.2f}mm, minimum is "
+                    f"{RULES['min_center_thickness_mm']}mm, increase it"
                 )
             if t > RULES["max_center_thickness_mm"]:
                 problems.append(
-                    f"center thickness of element starting at surface {i} is {t:.2f}mm, "
-                    f"maximum is {RULES['max_center_thickness_mm']}mm, reduce it"
+                    f"center thickness of the element at surface {i} is {t:.2f}mm, maximum is "
+                    f"{RULES['max_center_thickness_mm']}mm, reduce it"
                 )
-            try:
-                problem = optimization.OptimizationProblem()
-                problem.add_operand(
-                    operand_type="edge_thickness",
-                    target=0,
-                    input_data={"optic": lens, "surface_number": i},
-                )
-                edge = float(problem.operands[0].value)
-                if edge < RULES["min_edge_thickness_mm"]:
+            if edge is not None and edge < RULES["min_edge_thickness_mm"]:
+                if edge <= 0:
                     problems.append(
-                        f"edge thickness of element starting at surface {i} is {edge:.2f}mm, "
-                        f"minimum is {RULES['min_edge_thickness_mm']}mm, increase center thickness, "
-                        f"weaken the curvature, or reduce the aperture"
+                        f"the element at surface {i} has an edge thickness of {edge:.2f}mm, so its "
+                        f"two surfaces cross before they reach the clear aperture. This is not a "
+                        f"lens. Increase the center thickness, weaken the curvature, or reduce the "
+                        f"aperture"
                     )
-            except Exception:
-                pass
-            sd = sds[i] if i < len(sds) else 0.0
+                else:
+                    problems.append(
+                        f"edge thickness of the element at surface {i} is {edge:.2f}mm, minimum is "
+                        f"{RULES['min_edge_thickness_mm']}mm, increase the center thickness, weaken "
+                        f"the curvature, or reduce the aperture"
+                    )
             if sd and t > 0 and (2 * sd) / t > RULES["max_diameter_to_thickness"]:
                 problems.append(
-                    f"element at surface {i} is too thin for its diameter "
-                    f"({2*sd:.1f}mm across, {t:.2f}mm thick), thicken it"
+                    f"the element at surface {i} is {2 * sd:.1f}mm across and only {t:.2f}mm thick "
+                    f"(ratio {(2 * sd) / t:.1f}, limit {RULES['max_diameter_to_thickness']}). It "
+                    f"will sag under its own weight and during polishing. Thicken it"
                 )
         else:
-            if 0 < t < RULES["min_air_gap_mm"]:
+            if 0 < t < RULES["min_air_gap_center_mm"]:
                 problems.append(
-                    f"air gap after surface {i} is {t:.2f}mm, minimum is {RULES['min_air_gap_mm']}mm"
+                    f"the air gap after surface {i} is {t:.2f}mm on axis, minimum is "
+                    f"{RULES['min_air_gap_center_mm']}mm"
+                )
+            if t > 0 and edge is not None and edge < RULES["min_air_gap_edge_mm"]:
+                problems.append(
+                    f"the air gap after surface {i} closes to {edge:.2f}mm at the edge, minimum is "
+                    f"{RULES['min_air_gap_edge_mm']}mm. The two elements touch or nearly touch off "
+                    f"axis even though the gap looks fine on axis"
                 )
     return problems
 
 
 class _WfeAtFields(RmsWavefrontErrorVsField):
-    """RmsWavefrontErrorVsField samples a linspace of fields. This one samples the fields we define."""
+    """RmsWavefrontErrorVsField samples a linspace of fields. This one samples ours."""
 
     def __init__(self, optic, fields, num_rays=12):
         Wavefront.__init__(self, optic, fields, "all", num_rays, "hexapolar")
@@ -181,26 +268,77 @@ def _norm_fields(lens: Optic) -> list[tuple[float, float]]:
     return [(0.0, y / m) for y in ys]
 
 
+def _efl_per_wavelength(lens: Optic) -> dict[float, float]:
+    """Focal length at each wavelength. The spread is the chromatic focal shift."""
+    wls = lens.wavelengths.wavelengths
+    original = [w.is_primary for w in wls]
+    out = {}
+    try:
+        for w in wls:
+            for other in wls:
+                other.is_primary = other is w
+            lens.updater.update_paraxial()
+            out[round(float(w.value), 4)] = float(np.ravel(lens.paraxial.f2())[0])
+    except Exception:
+        out = {}
+    finally:
+        for w, was in zip(wls, original):
+            w.is_primary = was
+        try:
+            lens.updater.update_paraxial()
+        except Exception:
+            pass
+    return out
+
+
+def _back_focal_distance(lens: Optic) -> float:
+    """Air gap from the last glass surface to the image plane."""
+    surfaces = lens.surfaces.surfaces
+    for i in range(len(surfaces) - 2, 0, -1):
+        t = float(surfaces[i].thickness)
+        if np.isfinite(t) and not _is_glass(surfaces[i]):
+            return round(t, 3)
+    return 0.0
+
+
 def _metrics(lens: Optic) -> dict:
     lens.updater.update_paraxial()
-    efl = float(lens.paraxial.f2())
+    efl = float(np.ravel(lens.paraxial.f2())[0])
     fields = _norm_fields(lens)
+
     sd = SpotDiagram(lens, fields=fields)
-    spot_um = [round(float(np.mean([float(v) for v in per_wl])) * 1000, 2) for per_wl in sd.rms_spot_radius()]
+    # v2: RMS across wavelengths, not mean. The mean read a few percent optimistic
+    # exactly where the spot threshold binds.
+    spot_um = [
+        round(float(np.sqrt(np.mean(np.asarray([float(v) for v in per_wl], dtype=float) ** 2))) * 1000, 2)
+        for per_wl in sd.rms_spot_radius()
+    ]
+
     try:
         w = _WfeAtFields(lens, fields)
         arr = np.asarray(be.to_numpy(w._wavefront_error) if hasattr(be, "to_numpy") else w._wavefront_error, dtype=float)
-        wfe_waves = [round(float(v), 4) for v in np.atleast_1d(arr.mean(axis=-1) if arr.ndim > 1 else arr)]
+        if arr.ndim > 1:
+            wfe_waves = [round(float(np.sqrt(np.mean(row ** 2))), 4) for row in arr]
+        else:
+            wfe_waves = [round(float(v), 4) for v in np.atleast_1d(arr)]
     except Exception as e:  # noqa: BLE001
         wfe_waves = [f"unavailable: {e.__class__.__name__}: {e}"]
+
+    efls = _efl_per_wavelength(lens)
+    chromatic = round(max(efls.values()) - min(efls.values()), 4) if len(efls) > 1 else 0.0
+
     return {
         "efl_mm": round(efl, 4),
-        "f_number": round(efl / float(lens.paraxial.EPD()), 3),
+        "f_number": round(efl / float(np.ravel(lens.paraxial.EPD())[0]), 3),
         "rms_spot_um_per_field": spot_um,
         "rms_wavefront_waves_per_field": wfe_waves,
+        "chromatic_focal_shift_mm": chromatic,
+        "efl_per_wavelength_mm": {k: round(v, 3) for k, v in efls.items()},
+        "back_focal_distance_mm": _back_focal_distance(lens),
         "total_track_mm": round(float(lens.total_track), 3),
         "fields_deg": [float(f.y) for f in lens.fields.fields],
         "wavelengths_um": _wavelengths_um(lens),
+        "grader_version": VERSION,
     }
 
 
@@ -287,14 +425,36 @@ def optimize(
     if solver != "least_squares":
         # Global solvers scale badly with variable count. Cap them so one call can't eat an hour.
         maxiter = min(maxiter, GLOBAL_MAXITER)
+    def _timeout(signum, frame):  # noqa: ARG001
+        raise TimeoutError(f"optimize exceeded {OPTIMIZE_TIMEOUT_S}s and was stopped")
+
+    armed = False
     try:
+        try:
+            signal.signal(signal.SIGALRM, _timeout)
+            signal.setitimer(signal.ITIMER_REAL, OPTIMIZE_TIMEOUT_S)
+            armed = True
+        except (ValueError, AttributeError):
+            pass  # not the main thread, or no SIGALRM; run without the guard
         if solver == "least_squares":
             bounded = any(v.get("min") is not None or v.get("max") is not None for v in variables)
             opt.optimize(maxiter=maxiter, tol=1e-6, method_choice="trf" if bounded else "lm")
         else:
             opt.optimize(maxiter=maxiter)
+    except TimeoutError as e:
+        return {
+            "lens_id": lens_id,
+            "error": f"{e}. Reduce the variable count, tighten the bounds, or use least_squares.",
+            "before": before,
+        }
     except Exception as e:  # noqa: BLE001
         return {"lens_id": lens_id, "error": f"{e.__class__.__name__}: {e}", "before": before}
+    finally:
+        if armed:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except Exception:
+                pass
     ITERATIONS[lens_id] += 1
     after = _metrics(lens)
     after["manufacturability_violations"] = _manufacturability(lens)

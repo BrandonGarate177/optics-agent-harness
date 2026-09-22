@@ -34,6 +34,7 @@ import lens_tools as lt
 ROOT = Path(__file__).parent
 import os
 MAX_OPTIMIZE = int(os.environ.get("LENS_MAX_OPTIMIZE", "10"))
+HARNESS_VERSION = "2.0"
 REFUSAL = "CANNOT MEET SPEC"
 SYSTEM_PROMPT = (ROOT / "system_prompt.md").read_text()
 
@@ -223,7 +224,7 @@ def make_hooks(run: Run, targets: dict | None):
 
 
 def _meets(m: dict, targets: dict | None) -> bool:
-    """Deterministic pass/fail against the case targets. No targets means any clean lens passes."""
+    """Deterministic pass/fail against the case targets. Grader v2."""
     if m.get("manufacturability_violations"):
         return False
     if not targets:
@@ -238,13 +239,21 @@ def _meets(m: dict, targets: dict | None) -> bool:
         return False
     if "max_track_mm" in targets and m.get("total_track_mm", 0) > targets["max_track_mm"]:
         return False
+    # v2 gates
+    if "max_wavefront_waves" in targets:
+        wfe = m.get("rms_wavefront_waves_per_field") or []
+        nums = [v for v in wfe if isinstance(v, (int, float))]
+        if not nums or max(nums) > targets["max_wavefront_waves"]:
+            return False
+    if "max_chromatic_shift_mm" in targets:
+        c = m.get("chromatic_focal_shift_mm")
+        if not isinstance(c, (int, float)) or c > targets["max_chromatic_shift_mm"]:
+            return False
+    if "min_bfd_mm" in targets:
+        b = m.get("back_focal_distance_mm")
+        if not isinstance(b, (int, float)) or b < targets["min_bfd_mm"]:
+            return False
     return True
-
-
-BASELINE_SUFFIX = (
-    "\n\nUse the lens tools to do this. Call export on the final lens when it meets the spec. "
-    f"If the spec cannot be met, reply starting with '{REFUSAL}:' and explain why."
-)
 
 
 async def run_spec(
@@ -287,7 +296,7 @@ async def run_spec(
             cwd=str(scratch),
             **({"model": model} if model else {}),
         )
-    run.log({"event": "start", "arm": arm, "prompt": prompt, "targets": targets})
+    run.log({"event": "start", "arm": arm, "harness_version": HARNESS_VERSION, "grader_version": lt.VERSION, "prompt": prompt, "targets": targets})
     async for msg in query(prompt=prompt, options=options):
         if isinstance(msg, AssistantMessage):
             for block in msg.content:
