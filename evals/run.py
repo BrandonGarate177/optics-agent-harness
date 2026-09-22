@@ -64,6 +64,7 @@ async def main():
     ap.add_argument("--arm", default="harness", choices=["harness", "baseline"])
     ap.add_argument("--label", default=None)
     ap.add_argument("--resume", default=None, help="log dir: rerun only rows that crashed on a transient API error")
+    ap.add_argument("-j", "--concurrency", type=int, default=4, help="runs in flight at once (1 = sequential)")
     args = ap.parse_args()
 
     cases = json.loads((ROOT / "evals" / "cases.json").read_text())
@@ -85,39 +86,55 @@ async def main():
         rows = [r for r in prev_rows if (r["case"], r["k"]) not in crashed]
         todo = [(c, k) for c in cases for k in range(args.k) if (c["id"], k) in crashed]
         print(f"resuming {log_dir.name}: rerunning {len(todo)} crashed rows")
-    for case, k in todo:
-            run_id = f"{case['id']}-{k}"
-            print(f"\n=== {run_id}")
+    sem = asyncio.Semaphore(max(1, args.concurrency))
+    verbose = args.concurrency == 1
+    done = 0
+    total = len(todo)
+
+    async def one(case, k):
+        nonlocal done
+        run_id = f"{case['id']}-{k}"
+        async with sem:
+            if verbose:
+                print(f"\n=== {run_id}")
             t0 = time.time()
             run = None
             for attempt in range(3):
                 try:
-                    run = await harness.run_spec(case["prompt"], run_id, targets=case["expect"], log_dir=log_dir, model=args.model, arm=args.arm)
+                    run = await harness.run_spec(
+                        case["prompt"], run_id, targets=case["expect"], log_dir=log_dir,
+                        model=args.model, arm=args.arm, verbose=verbose,
+                    )
                     ok, detail = grade(case, run)
                     break
                 except Exception as e:  # noqa: BLE001
                     ok, detail, run = False, f"crash: {e.__class__.__name__}: {e}", None
                     if _transient(detail) and attempt < 2:
-                        print(f"  transient API error, retrying in 60s ({attempt + 1}/2)")
+                        print(f"  {run_id}: transient API error, retrying in 60s ({attempt + 1}/2)")
                         await asyncio.sleep(60)
                         continue
                     break
-            rows.append(
-                {
-                    "case": case["id"],
-                    "k": k,
-                    "pass": ok,
-                    "detail": detail,
-                    "optimize_calls": run.optimize_calls if run else None,
-                    "tool_calls": len(run.tool_calls) if run else None,
-                    "turns": run.turns if run else None,
-                    "cost_usd": round(run.cost_usd, 4) if run and run.cost_usd else None,
-                    "seconds": round(time.time() - t0, 1),
-                }
-            )
-            print(f"  -> {'PASS' if ok else 'FAIL'}: {detail}")
+            done += 1
+            print(f"[{done}/{total}] {run_id:<16} {'PASS' if ok else 'FAIL':<5} {round(time.time() - t0)}s  {detail[:90]}", flush=True)
+            return {
+                "case": case["id"],
+                "k": k,
+                "pass": ok,
+                "detail": detail,
+                "optimize_calls": run.optimize_calls if run else None,
+                "tool_calls": len(run.tool_calls) if run else None,
+                "turns": run.turns if run else None,
+                "cost_usd": round(run.cost_usd, 4) if run and run.cost_usd else None,
+                "seconds": round(time.time() - t0, 1),
+            }
+
+    print(f"{total} runs, {args.arm} arm, {args.concurrency} at a time")
+    rows.extend(await asyncio.gather(*(one(c, k) for c, k in todo)))
     rows.sort(key=lambda r: (r["case"], r["k"]))
-    (log_dir / "results.json").write_text(json.dumps({"arm": args.arm, "k": args.k, "rows": rows}, indent=1))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "results.json").write_text(
+        json.dumps({"arm": args.arm, "k": args.k, "concurrency": args.concurrency, "rows": rows}, indent=1)
+    )
     print(f"\n{'case':<14}{'run':>4}  {'result':<6}{'opt':>4}{'sec':>7}  detail")
     for r in rows:
         print(f"{r['case']:<14}{r['k']:>4}  {'PASS' if r['pass'] else 'FAIL':<6}{str(r['optimize_calls']):>4}{r['seconds']:>7}  {r['detail']}")

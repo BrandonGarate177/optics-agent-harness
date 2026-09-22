@@ -109,7 +109,10 @@ def make_server(run: Run, targets: dict | None):
         {"elements": int, "f_number": float, "field_deg": float},
     )
     async def find_starting_point(args):
-        return _call("find_starting_point", lambda a: lt.find_starting_point(int(a["elements"]), float(a["f_number"]), float(a["field_deg"])), args)
+        return await asyncio.to_thread(
+            _call, "find_starting_point",
+            lambda a: lt.find_starting_point(int(a["elements"]), float(a["f_number"]), float(a["field_deg"])), args
+        )
 
     @tool(
         "build_lens",
@@ -121,7 +124,7 @@ def make_server(run: Run, targets: dict | None):
         {"type": "object", "properties": {"spec": {"type": "object"}}, "required": ["spec"]},
     )
     async def build_lens(args):
-        return _call("build_lens", lambda a: lt.build_lens(a["spec"]), args)
+        return await asyncio.to_thread(_call, "build_lens", lambda a: lt.build_lens(a["spec"]), args)
 
     @tool(
         "evaluate",
@@ -131,7 +134,7 @@ def make_server(run: Run, targets: dict | None):
         {"lens_id": str},
     )
     async def evaluate(args):
-        return _call("evaluate", lambda a: lt.evaluate(a["lens_id"]), args)
+        return await asyncio.to_thread(_call, "evaluate", lambda a: lt.evaluate(a["lens_id"]), args)
 
     @tool(
         "optimize",
@@ -155,11 +158,40 @@ def make_server(run: Run, targets: dict | None):
         },
     )
     async def optimize(args):
-        return _call(
-            "optimize",
-            lambda a: lt.optimize(a["lens_id"], variables=a["variables"], operands=a["operands"], solver=a.get("solver", "least_squares")),
-            args,
-        )
+        lens_id = args.get("lens_id", "")
+        snap = None
+        try:
+            snap = await asyncio.to_thread(lt.snapshot, lens_id)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _call, "optimize",
+                    lambda a: lt.optimize(
+                        a["lens_id"], variables=a["variables"], operands=a["operands"],
+                        solver=a.get("solver", "least_squares"),
+                    ),
+                    args,
+                ),
+                timeout=lt.OPTIMIZE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            # The worker thread keeps running, so roll the lens back to the snapshot.
+            # The orphaned thread mutates the discarded object, not the live one.
+            if snap is not None:
+                try:
+                    await asyncio.to_thread(lt.restore, lens_id, snap)
+                except Exception:  # noqa: BLE001
+                    pass
+            msg = (
+                f"optimize exceeded {lt.OPTIMIZE_TIMEOUT_S}s and was stopped. The lens is unchanged. "
+                f"Reduce the variable count, tighten the bounds, or use least_squares."
+            )
+            run.log({"event": "tool", "tool": "optimize", "input": args, "output": msg,
+                     "error": True, "timeout": True, "optimize_calls": run.optimize_calls,
+                     "last_eval_ok": run.last_eval_ok})
+            return _err(msg)
 
     @tool(
         "export",
@@ -168,7 +200,9 @@ def make_server(run: Run, targets: dict | None):
         {"lens_id": str},
     )
     async def export(args):
-        return _call("export", lambda a: lt.export(a["lens_id"], out_dir=str(ROOT / "out" / run.run_id)), args)
+        return await asyncio.to_thread(
+            _call, "export", lambda a: lt.export(a["lens_id"], out_dir=str(ROOT / "out" / run.run_id)), args
+        )
 
     return create_sdk_mcp_server(name="lens", version="0.1.0", tools=[find_starting_point, build_lens, evaluate, optimize, export])
 
@@ -263,12 +297,12 @@ async def run_spec(
     log_dir: Path | None = None,
     model: str | None = None,
     arm: str = "harness",
+    verbose: bool = True,
 ) -> Run:
     """arm='harness': our system prompt, only the lens tools, hooks on.
     arm='baseline': Claude Code's own system prompt and built-in tools, same lens tools, no hooks."""
+    # No global state reset: lens ids are uuids, so concurrent runs coexist safely.
     run = Run(run_id, log_dir or ROOT / "logs")
-    lt.STATE.clear()
-    lt.ITERATIONS.clear()
     server = make_server(run, targets)
     if arm == "harness":
         options = ClaudeAgentOptions(
@@ -301,12 +335,14 @@ async def run_spec(
         if isinstance(msg, AssistantMessage):
             for block in msg.content:
                 if isinstance(block, ToolUseBlock):
-                    print(f"  [tool] {block.name.split('__')[-1]} {json.dumps(block.input, default=str)[:160]}")
+                    if verbose:
+                        print(f"  [tool] {block.name.split('__')[-1]} {json.dumps(block.input, default=str)[:160]}")
                 elif isinstance(block, TextBlock) and block.text.strip():
                     run.final_text = block.text
                     if REFUSAL in block.text:
                         run.refused = True
-                    print(f"  [agent] {block.text.strip()[:300]}")
+                    if verbose:
+                        print(f"  [agent] {block.text.strip()[:300]}")
         elif isinstance(msg, ResultMessage):
             run.cost_usd, run.turns = msg.total_cost_usd, msg.num_turns
             run.log({"event": "result", "subtype": msg.subtype, "turns": msg.num_turns, "cost_usd": msg.total_cost_usd})

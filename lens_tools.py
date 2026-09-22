@@ -7,7 +7,6 @@ ids and numbers, never the Optic object.
 from __future__ import annotations
 
 import json
-import signal
 import uuid
 from pathlib import Path
 
@@ -335,6 +334,7 @@ def _metrics(lens: Optic) -> dict:
         "chromatic_focal_shift_mm": chromatic,
         "efl_per_wavelength_mm": {k: round(v, 3) for k, v in efls.items()},
         "back_focal_distance_mm": _back_focal_distance(lens),
+        "magnification": round(float(np.ravel(lens.paraxial.magnification())[0]), 4),
         "total_track_mm": round(float(lens.total_track), 3),
         "fields_deg": [float(f.y) for f in lens.fields.fields],
         "wavelengths_um": _wavelengths_um(lens),
@@ -425,36 +425,14 @@ def optimize(
     if solver != "least_squares":
         # Global solvers scale badly with variable count. Cap them so one call can't eat an hour.
         maxiter = min(maxiter, GLOBAL_MAXITER)
-    def _timeout(signum, frame):  # noqa: ARG001
-        raise TimeoutError(f"optimize exceeded {OPTIMIZE_TIMEOUT_S}s and was stopped")
-
-    armed = False
     try:
-        try:
-            signal.signal(signal.SIGALRM, _timeout)
-            signal.setitimer(signal.ITIMER_REAL, OPTIMIZE_TIMEOUT_S)
-            armed = True
-        except (ValueError, AttributeError):
-            pass  # not the main thread, or no SIGALRM; run without the guard
         if solver == "least_squares":
             bounded = any(v.get("min") is not None or v.get("max") is not None for v in variables)
             opt.optimize(maxiter=maxiter, tol=1e-6, method_choice="trf" if bounded else "lm")
         else:
             opt.optimize(maxiter=maxiter)
-    except TimeoutError as e:
-        return {
-            "lens_id": lens_id,
-            "error": f"{e}. Reduce the variable count, tighten the bounds, or use least_squares.",
-            "before": before,
-        }
     except Exception as e:  # noqa: BLE001
         return {"lens_id": lens_id, "error": f"{e.__class__.__name__}: {e}", "before": before}
-    finally:
-        if armed:
-            try:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-            except Exception:
-                pass
     ITERATIONS[lens_id] += 1
     after = _metrics(lens)
     after["manufacturability_violations"] = _manufacturability(lens)
@@ -466,6 +444,21 @@ def optimize(
         "after": after,
         "prescription": _prescription(lens),
     }
+
+
+def snapshot(lens_id: str) -> dict:
+    """Serialize a lens so a failed or timed-out optimize can be rolled back."""
+    lens = STATE[lens_id]
+    return {"optic": lens.to_dict(), "allow_aspheres": bool(getattr(lens, "_allow_aspheres", False))}
+
+
+def restore(lens_id: str, snap: dict) -> dict:
+    """Replace the lens with a snapshot. The old object is dropped, so a thread still
+    working on it cannot affect what the agent sees next."""
+    lens = Optic.from_dict(snap["optic"])
+    lens._allow_aspheres = snap.get("allow_aspheres", False)
+    STATE[lens_id] = lens
+    return {"lens_id": lens_id, "restored": True, "prescription": _prescription(lens)}
 
 
 def export(lens_id: str, out_dir: str = "out") -> dict:
