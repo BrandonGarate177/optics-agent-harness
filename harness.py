@@ -48,6 +48,8 @@ class Run:
         self.refused = False
         self.final_text = ""
         self.tool_calls: list[dict] = []
+        self.cost_usd: float | None = None
+        self.turns: int | None = None
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = log_dir / f"{run_id}.jsonl"
 
@@ -234,23 +236,53 @@ def _meets(m: dict, targets: dict | None) -> bool:
     return True
 
 
-async def run_spec(prompt: str, run_id: str, targets: dict | None = None, log_dir: Path | None = None, model: str | None = None) -> Run:
+BASELINE_SUFFIX = (
+    "\n\nUse the lens tools to do this. Call export on the final lens when it meets the spec. "
+    f"If the spec cannot be met, reply starting with '{REFUSAL}:' and explain why."
+)
+
+
+async def run_spec(
+    prompt: str,
+    run_id: str,
+    targets: dict | None = None,
+    log_dir: Path | None = None,
+    model: str | None = None,
+    arm: str = "harness",
+) -> Run:
+    """arm='harness': our system prompt, only the lens tools, hooks on.
+    arm='baseline': Claude Code's own system prompt and built-in tools, same lens tools, no hooks."""
     run = Run(run_id, log_dir or ROOT / "logs")
     lt.STATE.clear()
     lt.ITERATIONS.clear()
     server = make_server(run, targets)
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
-        mcp_servers={"lens": server},
-        allowed_tools=["mcp__lens__*"],
-        tools=[],
-        hooks=make_hooks(run, targets),
-        max_turns=60,
-        permission_mode="bypassPermissions",
-        cwd=str(ROOT),
-        **({"model": model} if model else {}),
-    )
-    run.log({"event": "start", "prompt": prompt, "targets": targets})
+    if arm == "harness":
+        options = ClaudeAgentOptions(
+            system_prompt=SYSTEM_PROMPT,
+            mcp_servers={"lens": server},
+            allowed_tools=["mcp__lens__*"],
+            tools=[],
+            hooks=make_hooks(run, targets),
+            max_turns=60,
+            permission_mode="bypassPermissions",
+            cwd=str(ROOT),
+            **({"model": model} if model else {}),
+        )
+    else:
+        scratch = ROOT / "out" / "baseline-scratch" / run_id
+        scratch.mkdir(parents=True, exist_ok=True)
+        prompt = prompt + BASELINE_SUFFIX
+        options = ClaudeAgentOptions(
+            system_prompt={"type": "preset", "preset": "claude_code"},
+            tools={"type": "preset", "preset": "claude_code"},
+            mcp_servers={"lens": server},
+            allowed_tools=["mcp__lens__*"],
+            max_turns=60,
+            permission_mode="bypassPermissions",
+            cwd=str(scratch),
+            **({"model": model} if model else {}),
+        )
+    run.log({"event": "start", "arm": arm, "prompt": prompt, "targets": targets})
     async for msg in query(prompt=prompt, options=options):
         if isinstance(msg, AssistantMessage):
             for block in msg.content:
@@ -262,6 +294,7 @@ async def run_spec(prompt: str, run_id: str, targets: dict | None = None, log_di
                         run.refused = True
                     print(f"  [agent] {block.text.strip()[:300]}")
         elif isinstance(msg, ResultMessage):
+            run.cost_usd, run.turns = msg.total_cost_usd, msg.num_turns
             run.log({"event": "result", "subtype": msg.subtype, "turns": msg.num_turns, "cost_usd": msg.total_cost_usd})
             if msg.result:
                 run.final_text = msg.result

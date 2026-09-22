@@ -56,14 +56,16 @@ async def main():
     ap.add_argument("-k", type=int, default=1)
     ap.add_argument("--only", default=None)
     ap.add_argument("--model", default=None)
-    ap.add_argument("--label", default="harness")
+    ap.add_argument("--arm", default="harness", choices=["harness", "baseline"])
+    ap.add_argument("--label", default=None)
     args = ap.parse_args()
 
     cases = json.loads((ROOT / "evals" / "cases.json").read_text())
     if args.only:
         cases = [c for c in cases if c["id"] == args.only]
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    log_dir = ROOT / "logs" / f"{args.label}-{stamp}"
+    label = args.label or args.arm
+    log_dir = ROOT / "logs" / f"{label}-{stamp}"
     rows = []
     for case in cases:
         for k in range(args.k):
@@ -71,7 +73,7 @@ async def main():
             print(f"\n=== {run_id}")
             t0 = time.time()
             try:
-                run = await harness.run_spec(case["prompt"], run_id, targets=case["expect"], log_dir=log_dir, model=args.model)
+                run = await harness.run_spec(case["prompt"], run_id, targets=case["expect"], log_dir=log_dir, model=args.model, arm=args.arm)
                 ok, detail = grade(case, run)
             except Exception as e:  # noqa: BLE001
                 ok, detail, run = False, f"crash: {e.__class__.__name__}: {e}", None
@@ -82,11 +84,14 @@ async def main():
                     "pass": ok,
                     "detail": detail,
                     "optimize_calls": run.optimize_calls if run else None,
+                    "tool_calls": len(run.tool_calls) if run else None,
+                    "turns": run.turns if run else None,
+                    "cost_usd": round(run.cost_usd, 4) if run and run.cost_usd else None,
                     "seconds": round(time.time() - t0, 1),
                 }
             )
             print(f"  -> {'PASS' if ok else 'FAIL'}: {detail}")
-    (log_dir / "results.json").write_text(json.dumps(rows, indent=1))
+    (log_dir / "results.json").write_text(json.dumps({"arm": args.arm, "k": args.k, "rows": rows}, indent=1))
     print(f"\n{'case':<14}{'run':>4}  {'result':<6}{'opt':>4}{'sec':>7}  detail")
     for r in rows:
         print(f"{r['case']:<14}{r['k']:>4}  {'PASS' if r['pass'] else 'FAIL':<6}{str(r['optimize_calls']):>4}{r['seconds']:>7}  {r['detail']}")
