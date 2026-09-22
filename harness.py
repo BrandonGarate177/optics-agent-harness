@@ -55,6 +55,7 @@ class Run:
         self.run_id = run_id
         self.optimize_calls = 0
         self.last_eval_ok: bool | None = None
+        self.spec_violations: list[str] = []
         self.exported = False
         self.refused = False
         self.final_text = ""
@@ -96,6 +97,8 @@ def make_server(run: Run, targets: dict | None):
                 run.last_eval_ok = _meets(payload["after"], targets)
             elif short == "evaluate":
                 run.last_eval_ok = _meets(payload, targets)
+            if short == "build_lens":
+                run.spec_violations = payload.get("spec_violations") or []
             elif short == "export" and "zmx" in payload:
                 run.exported = True
         entry = {
@@ -184,14 +187,16 @@ def make_server(run: Run, targets: dict | None):
     @tool(
         "build_lens",
         "Build a lens from a prescription and check it. Returns lens_id, system findings from Optiland's "
-        "check_system, effective focal length, and manufacturability violations written as what to change. "
+        "check_system, effective focal length, manufacturability violations, and spec violations: "
+        "whether this is actually the lens that was asked for, in aperture, fields and wavelengths. "
+        "All violations are written as what to change. "
         "spec = {surfaces:[{radius,thickness,material,is_stop}], epd, fields_deg:[..], wavelengths_um:[..]}. "
         "Surface 0 is the object: thickness null means the object is at infinity, a number means the object sits that many mm in front of surface 1 (finite conjugate). Last surface is the image. radius null = flat. "
         "material null = air. Set is_stop on exactly one surface.",
         {"type": "object", "properties": {"spec": {"type": "object"}}, "required": ["spec"]},
     )
     async def build_lens(args):
-        return await asyncio.to_thread(_call, "build_lens", lambda a: lt.build_lens(a["spec"]), args)
+        return await asyncio.to_thread(_call, "build_lens", lambda a: lt.build_lens(a["spec"], targets), args)
 
     @tool(
         "evaluate",
@@ -300,6 +305,13 @@ def make_hooks(run: Run, targets: dict | None):
             return deny(
                 f"Tool budget spent ({MAX_TOOL_CALLS} calls). {state} Either export, or write a "
                 f"refusal starting with '{REFUSAL}:'.",
+                short, tin,
+            )
+        if short == "optimize" and run.spec_violations:
+            return deny(
+                "The lens you are optimising does not match the spec: "
+                + "; ".join(run.spec_violations)
+                + ". Rebuild it correctly first. Optimising it further cannot make it pass.",
                 short, tin,
             )
         if short == "optimize":

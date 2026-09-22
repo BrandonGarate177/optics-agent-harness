@@ -346,7 +346,47 @@ def _metrics(lens: Optic) -> dict:
 # ---- public tools ---------------------------------------------------------
 
 
-def build_lens(spec: dict) -> dict:
+def spec_violations(lens: Optic, targets: dict | None) -> list[str]:
+    """Does this lens match what the customer asked for, regardless of how well it performs?
+
+    v3: checked at build time, not only at export. The agent used to drift off the
+    required aperture while stuck, spend its whole optimize budget polishing a lens
+    that could never pass, and only hear about it at the end. Five runs died that way.
+    """
+    if not targets:
+        return []
+    out = []
+    try:
+        lens.updater.update_paraxial()
+        efl = float(np.ravel(lens.paraxial.f2())[0])
+        epd = float(np.ravel(lens.paraxial.EPD())[0])
+        fno = efl / epd if epd else None
+    except Exception:  # noqa: BLE001
+        fno = None
+    want = targets.get("f_number")
+    if want and isinstance(fno, float):
+        tol = targets.get("f_number_tol_pct", 3) / 100 * want
+        if abs(fno - want) > tol:
+            needed = efl / want
+            out.append(
+                f"this lens is f/{fno:.2f} but the spec asks for f/{want}. Set the entrance pupil "
+                f"to {needed:.3f}mm for a {efl:.1f}mm focal length. Relaxing the aperture makes the "
+                f"lens easier but it is not the lens that was requested"
+            )
+    if "fields_deg" in targets:
+        got = [round(float(f.y), 3) for f in lens.fields.fields]
+        wanted = [round(float(f), 3) for f in targets["fields_deg"]]
+        if got != wanted:
+            out.append(f"fields are {got} but the spec asks for {wanted} degrees")
+    if "wavelengths_um" in targets:
+        got = [round(float(w), 4) for w in _wavelengths_um(lens)]
+        wanted = [round(float(w), 4) for w in targets["wavelengths_um"]]
+        if got != wanted:
+            out.append(f"wavelengths are {got} but the spec asks for {wanted} microns")
+    return out
+
+
+def build_lens(spec: dict, targets: dict | None = None) -> dict:
     lens = _build_optic(spec)
     lens_id = _new_id()
     STATE[lens_id] = lens
@@ -360,10 +400,11 @@ def build_lens(spec: dict) -> dict:
     }
     if report.ok:
         try:
-            out["efl_mm"] = round(float(lens.paraxial.f2()), 4)
+            out["efl_mm"] = round(float(np.ravel(lens.paraxial.f2())[0]), 4)
         except Exception as e:  # noqa: BLE001
             out["efl_mm"] = f"unavailable: {e}"
         out["manufacturability_violations"] = _manufacturability(lens)
+        out["spec_violations"] = spec_violations(lens, targets)
     return out
 
 
@@ -616,7 +657,28 @@ def list_glasses(
     for the library's pair. `near` returns the neighbours of a named glass on the
     glass map, which is how a designer actually explores alternatives.
     """
-    from optiland.materials import get_nd_vd, get_neighbour_glasses, glasses_selection  # noqa: PLC0415
+    from optiland.materials import Material, get_neighbour_glasses, glasses_selection  # noqa: PLC0415
+
+    def in_band(name: str) -> tuple[float, float] | None:
+        """Index and Abbe number measured in the requested band, not at 587nm.
+
+        v3 fix: this used get_nd_vd, which always returns d-line values. On a SWIR
+        or thermal case that is actively misleading, because the glass map
+        compresses in the infrared and a pairing that achromatises beautifully in
+        the visible can carry several times the secondary spectrum at 1300nm.
+        """
+        mid = (lambda_min_um + lambda_max_um) / 2.0
+        try:
+            m = Material(name)
+            n_short = float(np.ravel(m.n(lambda_min_um))[0])
+            n_mid = float(np.ravel(m.n(mid))[0])
+            n_long = float(np.ravel(m.n(lambda_max_um))[0])
+        except Exception:  # noqa: BLE001
+            return None
+        spread = n_short - n_long
+        if not np.isfinite(n_mid) or n_mid < 1.05 or abs(spread) < 1e-9:
+            return None  # no usable dispersion data in this band
+        return round(n_mid, 4), round((n_mid - 1.0) / spread, 1)
 
     available = glasses_selection(
         lambda_min=lambda_min_um, lambda_max=lambda_max_um, catalogs=RULES["allowed_catalogs"]
@@ -630,15 +692,12 @@ def list_glasses(
         names = available
     out = []
     for g in names:
-        try:
-            nd, vd = get_nd_vd(g)
-            out.append({"glass": g, "nd": round(float(nd), 4), "abbe_vd": round(float(vd), 2)})
-        except Exception:  # noqa: BLE001
+        nv = in_band(g)
+        if nv is None:
             continue
-    out.sort(key=lambda r: -r["abbe_vd"])
+        out.append({"glass": g, "n": nv[0], "abbe": nv[1]})
+    out.sort(key=lambda r: -r["abbe"])
     if not near and len(out) > count:
-        # Even spread across the Abbe range, so the agent sees crowns and flints,
-        # not an alphabetical slice of one corner of the glass map.
         idx = [round(i * (len(out) - 1) / (count - 1)) for i in range(count)]
         out = [out[i] for i in sorted(set(idx))]
     return {
@@ -646,8 +705,11 @@ def list_glasses(
         "catalogs": RULES["allowed_catalogs"],
         "count": len(out),
         "glasses": out,
-        "note": "High Abbe number means low dispersion (crown). Low Abbe means high dispersion (flint). "
-                "An achromat pairs a crown and a flint; a wider Abbe split lets the crown carry less power.",
+        "note": "Index and Abbe number are measured across the band you asked for, not at 587nm. "
+                "High Abbe means low dispersion (a crown), low Abbe means high dispersion (a flint). "
+                "An achromat pairs the two, and a wider split lets the crown carry less power. "
+                "Outside the visible the glass map compresses, so pairings that work at 587nm often "
+                "do not: check the split in your own band rather than assuming.",
     }
 
 
