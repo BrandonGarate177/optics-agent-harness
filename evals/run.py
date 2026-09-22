@@ -21,6 +21,11 @@ import harness  # noqa: E402
 import lens_tools as lt  # noqa: E402
 
 
+def _transient(detail: str) -> bool:
+    d = detail or ""
+    return d.startswith("crash") and any(x in d for x in ("529", "500 Internal", "Overloaded", "503", "overloaded_error"))
+
+
 def grade(case: dict, run: harness.Run) -> tuple[bool, str]:
     exp = case["expect"]
     if not exp.get("export", True):
@@ -58,6 +63,7 @@ async def main():
     ap.add_argument("--model", default=None)
     ap.add_argument("--arm", default="harness", choices=["harness", "baseline"])
     ap.add_argument("--label", default=None)
+    ap.add_argument("--resume", default=None, help="log dir: rerun only rows that crashed on a transient API error")
     args = ap.parse_args()
 
     cases = json.loads((ROOT / "evals" / "cases.json").read_text())
@@ -67,16 +73,35 @@ async def main():
     label = args.label or args.arm
     log_dir = ROOT / "logs" / f"{label}-{stamp}"
     rows = []
-    for case in cases:
-        for k in range(args.k):
+    todo = [(case, k) for case in cases for k in range(args.k)]
+    if args.resume:
+        log_dir = Path(args.resume)
+        prev = json.loads((log_dir / "results.json").read_text())
+        prev_rows = prev["rows"] if isinstance(prev, dict) else prev
+        if isinstance(prev, dict):
+            args.arm = prev.get("arm", args.arm)
+            args.k = prev.get("k", args.k)
+        crashed = {(r["case"], r["k"]) for r in prev_rows if _transient(r["detail"])}
+        rows = [r for r in prev_rows if (r["case"], r["k"]) not in crashed]
+        todo = [(c, k) for c in cases for k in range(args.k) if (c["id"], k) in crashed]
+        print(f"resuming {log_dir.name}: rerunning {len(todo)} crashed rows")
+    for case, k in todo:
             run_id = f"{case['id']}-{k}"
             print(f"\n=== {run_id}")
             t0 = time.time()
-            try:
-                run = await harness.run_spec(case["prompt"], run_id, targets=case["expect"], log_dir=log_dir, model=args.model, arm=args.arm)
-                ok, detail = grade(case, run)
-            except Exception as e:  # noqa: BLE001
-                ok, detail, run = False, f"crash: {e.__class__.__name__}: {e}", None
+            run = None
+            for attempt in range(3):
+                try:
+                    run = await harness.run_spec(case["prompt"], run_id, targets=case["expect"], log_dir=log_dir, model=args.model, arm=args.arm)
+                    ok, detail = grade(case, run)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    ok, detail, run = False, f"crash: {e.__class__.__name__}: {e}", None
+                    if _transient(detail) and attempt < 2:
+                        print(f"  transient API error, retrying in 60s ({attempt + 1}/2)")
+                        await asyncio.sleep(60)
+                        continue
+                    break
             rows.append(
                 {
                     "case": case["id"],
@@ -91,6 +116,7 @@ async def main():
                 }
             )
             print(f"  -> {'PASS' if ok else 'FAIL'}: {detail}")
+    rows.sort(key=lambda r: (r["case"], r["k"]))
     (log_dir / "results.json").write_text(json.dumps({"arm": args.arm, "k": args.k, "rows": rows}, indent=1))
     print(f"\n{'case':<14}{'run':>4}  {'result':<6}{'opt':>4}{'sec':>7}  detail")
     for r in rows:

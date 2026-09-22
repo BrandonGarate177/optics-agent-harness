@@ -1,0 +1,18 @@
+case          arm         pass  pass^k  med sec   med $  med opt  med tools
+achromat_100  harness      3/3    True    120.0    0.29        3          9
+achromat_100  baseline     3/3    True     76.0    0.67        1          6
+
+edge_rule     harness      3/3    True     84.0    0.89        3          9
+edge_rule     baseline     3/3    True     87.0    0.66        2          6
+
+impossible    harness      3/3    True    235.0    0.19        0          0
+impossible    baseline     3/3    True   2690.0    0.75        1          6
+
+singlet_50    harness      3/3    True    119.0    0.29        3          8
+singlet_50    baseline     3/3    True    165.0    0.67        1          5
+
+triplet_50    harness      3/3    True    622.0    1.82        5         11
+triplet_50    baseline     3/3    True   1633.0    0.76        2          8
+
+harness    passed 15/15   total $11.25   total 132.8 min   pass^k cases 5/5
+baseline   passed 15/15   total $10.83   total 231.1 min   pass^k cases 5/5

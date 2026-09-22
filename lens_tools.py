@@ -31,6 +31,8 @@ RULES = {
     "allowed_catalogs": ["schott", "ohara"],
 }
 
+GLOBAL_MAXITER = 25
+
 SOLVERS = {
     "least_squares": optimization.LeastSquares,
     "differential_evolution": optimization.DifferentialEvolution,
@@ -282,6 +284,9 @@ def optimize(
         problem.add_operand(**kwargs)
     cls = SOLVERS[solver]
     opt = cls(problem)
+    if solver != "least_squares":
+        # Global solvers scale badly with variable count. Cap them so one call can't eat an hour.
+        maxiter = min(maxiter, GLOBAL_MAXITER)
     try:
         if solver == "least_squares":
             bounded = any(v.get("min") is not None or v.get("max") is not None for v in variables)
