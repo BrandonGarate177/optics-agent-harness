@@ -295,6 +295,12 @@ def _meets(m: dict, targets: dict | None) -> bool:
     return True
 
 
+BASELINE_SUFFIX = (
+    "\n\nUse the lens tools to do this. Call export on the final lens when it meets the spec. "
+    f"If the spec cannot be met, reply starting with '{REFUSAL}:' and explain why."
+)
+
+
 async def run_spec(
     prompt: str,
     run_id: str,

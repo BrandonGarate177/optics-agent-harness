@@ -61,7 +61,7 @@ async def main():
     ap.add_argument("-k", type=int, default=1)
     ap.add_argument("--only", default=None)
     ap.add_argument("--model", default=None)
-    ap.add_argument("--arm", default="harness", choices=["harness", "baseline"])
+    ap.add_argument("--arm", default="harness", choices=["harness", "baseline", "both"])
     ap.add_argument("--label", default=None)
     ap.add_argument("--resume", default=None, help="log dir: rerun only rows that crashed on a transient API error")
     ap.add_argument("-j", "--concurrency", type=int, default=4, help="runs in flight at once (1 = sequential)")
@@ -71,10 +71,12 @@ async def main():
     if args.only:
         cases = [c for c in cases if c["id"] == args.only]
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    label = args.label or args.arm
-    log_dir = ROOT / "logs" / f"{label}-{stamp}"
+    arms = ["harness", "baseline"] if args.arm == "both" else [args.arm]
+    # "both" pairs each case's arms into one pool so they see the same API conditions.
+    log_dirs = {a: ROOT / "logs" / f"{(args.label + '-' if args.label else '') + a}-{stamp}" for a in arms}
+    log_dir = log_dirs[arms[0]]
     rows = []
-    todo = [(case, k) for case in cases for k in range(args.k)]
+    todo = [(case, k, a) for case in cases for k in range(args.k) for a in arms]
     if args.resume:
         log_dir = Path(args.resume)
         prev = json.loads((log_dir / "results.json").read_text())
@@ -84,16 +86,18 @@ async def main():
             args.k = prev.get("k", args.k)
         crashed = {(r["case"], r["k"]) for r in prev_rows if _transient(r["detail"])}
         rows = [r for r in prev_rows if (r["case"], r["k"]) not in crashed]
-        todo = [(c, k) for c in cases for k in range(args.k) if (c["id"], k) in crashed]
+        log_dirs = {args.arm: log_dir}
+        todo = [(c, k, args.arm) for c in cases for k in range(args.k) if (c["id"], k) in crashed]
         print(f"resuming {log_dir.name}: rerunning {len(todo)} crashed rows")
     sem = asyncio.Semaphore(max(1, args.concurrency))
     verbose = args.concurrency == 1
     done = 0
     total = len(todo)
 
-    async def one(case, k):
+    async def one(case, k, arm):
         nonlocal done
         run_id = f"{case['id']}-{k}"
+        ldir = log_dirs[arm]
         async with sem:
             if verbose:
                 print(f"\n=== {run_id}")
@@ -102,23 +106,24 @@ async def main():
             for attempt in range(3):
                 try:
                     run = await harness.run_spec(
-                        case["prompt"], run_id, targets=case["expect"], log_dir=log_dir,
-                        model=args.model, arm=args.arm, verbose=verbose,
+                        case["prompt"], run_id, targets=case["expect"], log_dir=ldir,
+                        model=args.model, arm=arm, verbose=verbose,
                     )
                     ok, detail = grade(case, run)
                     break
                 except Exception as e:  # noqa: BLE001
                     ok, detail, run = False, f"crash: {e.__class__.__name__}: {e}", None
                     if _transient(detail) and attempt < 2:
-                        print(f"  {run_id}: transient API error, retrying in 60s ({attempt + 1}/2)")
+                        print(f"  {arm}/{run_id}: transient API error, retrying in 60s ({attempt + 1}/2)")
                         await asyncio.sleep(60)
                         continue
                     break
             done += 1
-            print(f"[{done}/{total}] {run_id:<16} {'PASS' if ok else 'FAIL':<5} {round(time.time() - t0)}s  {detail[:90]}", flush=True)
+            print(f"[{done}/{total}] {arm[:4]:<5}{run_id:<16} {'PASS' if ok else 'FAIL':<5} {round(time.time() - t0)}s  {detail[:80]}", flush=True)
             return {
                 "case": case["id"],
                 "k": k,
+                "arm": arm,
                 "pass": ok,
                 "detail": detail,
                 "optimize_calls": run.optimize_calls if run else None,
@@ -128,13 +133,19 @@ async def main():
                 "seconds": round(time.time() - t0, 1),
             }
 
-    print(f"{total} runs, {args.arm} arm, {args.concurrency} at a time")
-    rows.extend(await asyncio.gather(*(one(c, k) for c, k in todo)))
+    print(f"{total} runs, {'paired arms' if args.arm == 'both' else args.arm + ' arm'}, {args.concurrency} at a time")
+    rows.extend(await asyncio.gather(*(one(c, k, a) for c, k, a in todo)))
     rows.sort(key=lambda r: (r["case"], r["k"]))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    (log_dir / "results.json").write_text(
-        json.dumps({"arm": args.arm, "k": args.k, "concurrency": args.concurrency, "rows": rows}, indent=1)
-    )
+    for a in arms:
+        log_dirs[a].mkdir(parents=True, exist_ok=True)
+        (log_dirs[a] / "results.json").write_text(
+            json.dumps(
+                {"arm": a, "k": args.k, "concurrency": args.concurrency,
+                 "rows": [r for r in rows if r.get("arm", a) == a]},
+                indent=1,
+            )
+        )
+    print("\nlogs:", *[str(log_dirs[a]) for a in arms], sep="\n  ")
     print(f"\n{'case':<14}{'run':>4}  {'result':<6}{'opt':>4}{'sec':>7}  detail")
     for r in rows:
         print(f"{r['case']:<14}{r['k']:>4}  {'PASS' if r['pass'] else 'FAIL':<6}{str(r['optimize_calls']):>4}{r['seconds']:>7}  {r['detail']}")
