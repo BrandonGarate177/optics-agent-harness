@@ -32,7 +32,8 @@ from claude_agent_sdk import (
 import lens_tools as lt
 
 ROOT = Path(__file__).parent
-MAX_OPTIMIZE = 10
+import os
+MAX_OPTIMIZE = int(os.environ.get("LENS_MAX_OPTIMIZE", "10"))
 REFUSAL = "CANNOT MEET SPEC"
 SYSTEM_PROMPT = (ROOT / "system_prompt.md").read_text()
 
@@ -172,7 +173,8 @@ def make_server(run: Run, targets: dict | None):
 
 
 def make_hooks(run: Run, targets: dict | None):
-    def deny(reason: str) -> dict:
+    def deny(reason: str, tool: str = "", tool_input: dict | None = None) -> dict:
+        run.log({"event": "hook_deny", "tool": tool, "input": tool_input or {}, "reason": reason})
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -183,22 +185,26 @@ def make_hooks(run: Run, targets: dict | None):
 
     async def pre_tool(input_data, tool_use_id, context):
         name = input_data.get("tool_name", "")
-        if name.endswith("__optimize"):
+        short = name.split("__")[-1]
+        tin = input_data.get("tool_input") or {}
+        if short == "optimize":
             if run.optimize_calls >= MAX_OPTIMIZE:
                 return deny(
                     f"Iteration budget spent ({MAX_OPTIMIZE} optimize calls). Either export the best lens you have "
-                    f"if it meets spec, or write a refusal starting with '{REFUSAL}:'."
+                    f"if it meets spec, or write a refusal starting with '{REFUSAL}:'.",
+                    short, tin,
                 )
-            if not (input_data.get("tool_input") or {}).get("reason"):
-                return deny("optimize needs a one-sentence reason (your hypothesis) before it runs.")
-        if name.endswith("__export"):
+            if not tin.get("reason"):
+                return deny("optimize needs a one-sentence reason (your hypothesis) before it runs.", short, tin)
+        if short == "export":
             if run.last_eval_ok is False:
                 return deny(
                     "The last evaluate did not meet the targets or had manufacturability violations. "
-                    "Fix the lens or write a refusal. Export is only for a passing lens."
+                    "Fix the lens or write a refusal. Export is only for a passing lens.",
+                    short, tin,
                 )
             if run.last_eval_ok is None:
-                return deny("Call evaluate before export.")
+                return deny("Call evaluate before export.", short, tin)
         return {}
 
     async def stop(input_data, tool_use_id, context):
@@ -206,10 +212,9 @@ def make_hooks(run: Run, targets: dict | None):
             return {}
         if input_data.get("stop_hook_active"):
             return {}
-        return {
-            "decision": "block",
-            "reason": f"You have not exported a lens or written a refusal starting with '{REFUSAL}:'. Do one of the two.",
-        }
+        reason = f"You have not exported a lens or written a refusal starting with '{REFUSAL}:'. Do one of the two."
+        run.log({"event": "hook_block_stop", "reason": reason})
+        return {"decision": "block", "reason": reason}
 
     return {
         "PreToolUse": [HookMatcher(matcher="^mcp__lens__", hooks=[pre_tool])],
